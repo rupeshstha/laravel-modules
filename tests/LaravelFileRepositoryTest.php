@@ -226,4 +226,29 @@ class LaravelFileRepositoryTest extends BaseTestCase
 
         $this->assertEquals('epicer', $module->getReverseName());
     }
-}
+
+    public function test_scan_caches_modules_after_first_call()
+    {
+        LaravelFileRepository::resetModules();
+        $this->repository->addLocation(__DIR__.'/stubs/valid');
+        $first = $this->repository->scan();
+        $second = $this->repository->scan();
+        $this->assertSame($first, $second);
+    }
+
+    public function test_reset_modules_clears_the_scan_cache()
+    {
+        $this->repository->addLocation(__DIR__.'/stubs/valid');
+        $this->repository->scan();
+        LaravelFileRepository::resetModules();
+        $afterReset = $this->repository->scan();
+        $this->assertNotEmpty($afterReset);
+    }
+
+    public function test_reset_modules_returns_fluent_interface()
+    {
+        $result = LaravelFileRepository::resetModules();
+        $this->assertInstanceOf(LaravelFileRepository::class, $result);
+    }
+
+    }
