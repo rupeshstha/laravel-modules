@@ -19,486 +19,651 @@ use Nwidart\Modules\Process\Updater;
 use Symfony\Component\Process\Process;
 
 abstract class FileRepository implements Countable, RepositoryInterface
-{
-    use Macroable;
+    {
+            use Macroable;
 
     /**
      * Application instance.
-     *
-     * @var \Illuminate\Contracts\Foundation\Application|Application
-     */
+             *
+             * @var \Illuminate\Contracts\Foundation\Application|\Laravel\Lumen\Application
+             */
     protected $app;
 
     /**
      * The module path.
-     */
-    protected ?string $path;
+             *
+             * @var string|null
+             */
+    protected $path;
 
     /**
      * The scanned paths.
-     */
-    protected array $paths = [];
+             *
+             * @var array
+             */
+    protected $paths = [];
 
     /**
-     * Stub path
-     */
-    protected ?string $stubPath = null;
+     * @var string
+             */
+    protected $stubPath;
 
     /**
-     * URL Generator
-     */
-    private UrlGenerator $url;
+     * @var UrlGenerator
+             */
+    private $url;
 
     /**
-     * Config Repository
-     */
-    private ConfigRepository $config;
+     * @var ConfigRepository
+             */
+    private $config;
 
     /**
-     * File system
-     */
-    private Filesystem $files;
+     * @var Filesystem
+             */
+    private $files;
 
-    private static $modules = [];
+    /**
+     * Instance-level memoization cache for scanned modules.
+             *
+             * Using an instance property (not static) ensures:
+     *  - Octane/Swoole workers cannot cross-contaminate each other's module lists
+              *  - Test isolation: each test gets a fresh repository from the IoC container
+              *  - artisan commands (route:cache, etc.) always see the real filesystem state
+              *    on their own singleton lifecycle, not a stale static from a previous run
+              *
+              * The trade-off vs. static: we rely on the service container registering
+              * FileRepository as a singleton (done in LaravelModulesServiceProvider), which
+              * means within one request/command lifecycle this cache is warm after the first
+              * scan, giving us the same O(1) re-access benefit without the cross-request
+              * corruption that static properties introduce.
+              *
+              * @var array|null  null = not yet scanned; array = cached scan result
+              */
+    private ?array $scannedModules = null;
+
+    /**
+     * @var string
+             */
+    protected $domain;
 
     /**
      * The constructor.
-     */
-    public function __construct(Container $app, ?string $path = null)
-    {
-        $this->app = $app;
-        $this->path = $path;
-        $this->url = $app['url'];
-        $this->config = $app['config'];
-        $this->files = $app['files'];
-    }
+             *
+             * @param  \Illuminate\Contracts\Foundation\Application  $app
+         * @param  string|null  $path
+         */
+    public function __construct($app, $path = null)
+        {
+                    $this->app = $app;
+                    $this->path = $path;
+                    $this->url = $app['url'];
+                    $this->config = $app['config'];
+                    $this->files = $app['files'];
+                    $this->domain = config('modules.domain');
+        }
 
     /**
      * Add other module location.
-     */
-    public function addLocation(string $path): self
-    {
-        $this->paths[] = $path;
+             *
+             * @param  string  $path
+             * @return $this
+         */
+    public function addLocation(string $path): static
+        {
+                    $this->paths[] = $path;
 
-        return $this;
-    }
+                return $this;
+        }
 
     /**
      * Get all additional paths.
-     */
+             *
+             * @return array
+         */
     public function getPaths(): array
-    {
-        return $this->paths;
-    }
+        {
+                    return $this->paths;
+        }
 
     /**
      * Get scanned modules paths.
-     */
+             *
+             * @return array
+         */
     public function getScanPaths(): array
-    {
-        $paths = $this->paths;
+        {
+                    $paths = $this->paths;
 
-        $paths[] = $this->getPath();
+                $paths[] = $this->getPath();
 
-        if ($this->config('scan.enabled')) {
-            $paths = array_merge($paths, $this->config('scan.paths'));
+                if ($this->config('scan.enabled')) {
+                                $paths = array_merge($paths, $this->config('scan.paths'));
+                }
+
+                $paths = array_map(function ($path) {
+                                return Str::endsWith($path, '/*') ? $path : Str::finish($path, '/*');
+                }, $paths);
+
+                return $paths;
         }
 
-        $paths = array_map(function ($path) {
-            return Str::endsWith($path, '/*') ? $path : Str::finish($path, '/*');
-        }, $paths);
-
-        return $paths;
-    }
-
     /**
-     * Creates a new Module instance
-     */
-    abstract protected function createModule(Container $app, string $name, string $path): Module;
+     * Creates a new Module instance.
+         *
+         * @param  mixed  ...$args
+         * @return TModule
+         */
+        abstract protected function createModule(...$args);
 
     /**
      * Get & scan all modules.
-     */
+             *
+             * Scans are memoized at the instance level for the lifetime of the singleton.
+             * This is intentionally NOT static so that:
+     *  - Octane workers each have their own isolated cache
+             *  - PHPUnit tests can call resetModules() or re-bind the container to get
+             *    a clean state without polluting other tests via static state
+             *
+             * @return array<string, \Nwidart\Modules\Module>
+             */
     public function scan(): array
-    {
-        if (! empty(self::$modules) && ! $this->app->runningUnitTests()) {
-            return self::$modules;
-        }
+        {
+                    if ($this->scannedModules !== null) {
+                                    return $this->scannedModules;
+                    }
 
         $paths = $this->getScanPaths();
 
         $modules = [];
 
         foreach ($paths as $key => $path) {
-            $manifests = (array) $this->getFiles()->glob("{$path}/module.json");
+                        $manifests = $this->getFiles()->glob("{$path}/module.json");
 
-            foreach ($manifests as $manifest) {
-                $json = Json::make($manifest);
-                $name = $json->get('name');
+                        is_array($manifests) || $manifests = [];
 
-                $modules[strtolower($name)] = $this->createModule($this->app, $name, dirname($manifest));
-            }
+                        foreach ($manifests as $manifest) {
+                                            $name = Json::make($manifest)->get('name');
+
+                            $lowerName = strtolower($name);
+
+                            $modules[$lowerName] = $this->createModule($this->app, $name, dirname($manifest));
+                        }
         }
 
-        self::$modules = $modules;
+        $this->scannedModules = $modules;
 
-        return self::$modules;
-    }
+        return $this->scannedModules;
+        }
 
     /**
      * Get all modules.
-     */
+             *
+             * @return array<string, \Nwidart\Modules\Module>
+             */
     public function all(): array
-    {
-        return $this->scan();
-    }
+        {
+                    if (! $this->config('cache.enabled')) {
+                                    return $this->scan();
+                    }
+
+        return $this->formatCached($this->getCached());
+        }
 
     /**
-     * Get all modules as collection instance.
-     */
-    public function toCollection(): Collection
-    {
-        return new Collection($this->scan());
-    }
+     * Format the cached data as array of modules.
+             *
+             * @param  array  $cached
+             * @return array<string, \Nwidart\Modules\Module>
+             */
+            public function formatCached($cached): array
+        {
+                    $modules = [];
+
+                foreach ($cached as $name => $module) {
+                                $path = $module['path'];
+
+                        $modules[$name] = $this->createModule($this->app, $name, $path);
+                }
+
+                return $modules;
+        }
+
+            /**
+             * Get cached modules.
+             *
+             * @return array
+             */
+            public function getCached(): array
+        {
+                    return $this->app['cache']->remember($this->config('cache.key'), $this->config('cache.lifetime'), function () {
+                                    return $this->toCollection()->toArray();
+                    });
+        }
+
+            /**
+             * Get all modules as collection instance.
+             *
+             * @return \Illuminate\Support\Collection
+             */
+            public function toCollection(): \Illuminate\Support\Collection
+        {
+                    return collect($this->scan());
+        }
 
     /**
      * Get modules by status.
-     */
-    public function getByStatus($status): array
-    {
-        $modules = [];
+             *
+             * @param  int  $status
+             * @return array<string, \Nwidart\Modules\Module>
+             */
+            public function getByStatus($status): array
+        {
+                    $modules = [];
 
-        /** @var Module $module */
-        foreach ($this->all() as $name => $module) {
-            if ($module->isStatus($status)) {
-                $modules[$name] = $module;
-            }
+                foreach ($this->all() as $name => $module) {
+                                if ($module->isStatus($status)) {
+                                                    $modules[$name] = $module;
+                                }
+                }
+
+                return $modules;
         }
 
-        return $modules;
-    }
+            /**
+             * Determine whether the given module exist.
+             *
+             * @param  string  $name
+             * @return bool
+             */
+            public function has(string $name): bool
+        {
+                    return array_key_exists($name, $this->all());
+        }
 
-    /**
-     * Determine whether the given module exist.
-     */
-    public function has($name): bool
-    {
-        return array_key_exists(strtolower($name), $this->all());
-    }
+            /**
+             * Get list of enabled modules.
+             *
+             * @return array<string, \Nwidart\Modules\Module>
+             */
+            public function allEnabled(): array
+        {
+                    return $this->getByStatus(true);
+        }
 
-    /**
-     * Get list of enabled modules.
-     */
-    public function allEnabled(): array
-    {
-        return $this->getByStatus(true);
-    }
+            /**
+             * Get list of disabled modules.
+             *
+             * @return array<string, \Nwidart\Modules\Module>
+             */
+            public function allDisabled(): array
+        {
+                    return $this->getByStatus(false);
+        }
 
-    /**
-     * Get list of disabled modules.
-     */
-    public function allDisabled(): array
-    {
-        return $this->getByStatus(false);
-    }
+            /**
+             * Get count of all modules.
+             *
+             * @return int
+             */
+            public function count(): int
+        {
+                    return count($this->all());
+        }
 
-    /**
-     * Get count from all modules.
-     */
-    public function count(): int
-    {
-        return count($this->all());
-    }
+            /**
+             * Get all ordered modules.
+             *
+             * @param  string  $direction
+             * @return array<string, \Nwidart\Modules\Module>
+             */
+            public function getOrdered(string $direction = 'asc'): array
+        {
+                    $modules = $this->allEnabled();
 
-    /**
-     * Get all ordered modules.
-     */
-    public function getOrdered(string $direction = 'asc'): array
-    {
-        $modules = $this->allEnabled();
+                uasort($modules, function (Module $a, Module $b) use ($direction) {
+                                if ($a->get('priority') === $b->get('priority')) {
+                                                    return 0;
+                                }
 
-        uasort($modules, function (Module $a, Module $b) use ($direction) {
-            if ($a->get('priority') === $b->get('priority')) {
-                return 0;
-            }
+                                   if ($direction === 'desc') {
+                                                       return $a->get('priority') < $b->get('priority') ? 1 : -1;
+                                   }
 
-            if ($direction === 'desc') {
-                return $a->get('priority') < $b->get('priority') ? 1 : -1;
-            }
+                                   return $a->get('priority') > $b->get('priority') ? 1 : -1;
+                });
 
-            return $a->get('priority') > $b->get('priority') ? 1 : -1;
-        });
+                return $modules;
+        }
 
-        return $modules;
-    }
+            /**
+             * {@inheritDoc}
+             */
+            public function getPath(): string
+        {
+                    return $this->path ?: $this->config('paths.modules', base_path('Modules'));
+        }
 
     /**
      * {@inheritDoc}
-     */
-    public function getPath(): string
-    {
-        return $this->path ?: $this->config('paths.modules', base_path('Modules'));
-    }
-
-    /**
-     * {@inheritDoc}
-     */
+             */
     public function register(): void
-    {
-        foreach ($this->getOrdered() as $module) {
-            $module->register();
+        {
+                    foreach ($this->getOrdered() as $module) {
+                                    $module->register();
+                    }
         }
-    }
 
     /**
      * {@inheritDoc}
-     */
+             */
     public function boot(): void
-    {
-        foreach ($this->getOrdered() as $module) {
-            $module->boot();
+        {
+                    foreach ($this->getOrdered() as $module) {
+                                    $module->boot();
+                    }
         }
-    }
 
     /**
      * {@inheritDoc}
-     */
+             */
     public function find(string $name): ?Module
-    {
-        return $this->all()[strtolower($name)] ?? null;
-    }
+        {
+                    foreach ($this->all() as $module) {
+                                    if ($module->getLowerName() === strtolower($name)) {
+                                                        return $module;
+                                    }
+                    }
+
+        return null;
+        }
 
     /**
      * Find a specific module, if there return that, otherwise throw exception.
-     *
-     * @throws ModuleNotFoundException
-     */
-    public function findOrFail(string $name): Module
-    {
-        $module = $this->find($name);
+             *
+             * @param  string  $name
+             * @return Module
+             *
+             * @throws ModuleNotFoundException
+             */
+            public function findOrFail(string $name): Module
+        {
+                    $module = $this->find($name);
 
         if ($module !== null) {
-            return $module;
+                        return $module;
         }
 
         throw new ModuleNotFoundException("Module [{$name}] does not exist!");
-    }
+        }
 
     /**
      * Get all modules as laravel collection instance.
-     */
-    public function collections($status = 1): Collection
-    {
-        return new Collection($this->getByStatus($status));
-    }
-
-    /**
-     * Get module path for a specific module.
-     */
-    public function getModulePath($module): string
-    {
-        try {
-            return $this->findOrFail($module)->getPath().'/';
-        } catch (ModuleNotFoundException $e) {
-            return $this->getPath().'/'.Str::studly($module).'/';
+             *
+             * @param  int  $status
+             * @return \Illuminate\Support\Collection<string, \Nwidart\Modules\Module>
+             */
+            public function collections($status = 1): Collection
+        {
+                    return new Collection($this->getByStatus($status));
         }
-    }
+
+            /**
+             * Get module path for a specific module.
+             *
+             * @param  string  $module
+             * @return string
+             */
+            public function getModulePath($module): string
+                {
+                            try {
+                                            return $this->findOrFail($module)->getPath().'/';
+                            } catch (ModuleNotFoundException $e) {
+                                            return $this->getPath().'/'.Str::studly($module).'/';
+                            }
+                }
 
     /**
      * {@inheritDoc}
-     */
+             */
     public function assetPath(string $module): string
-    {
-        return $this->config('paths.assets').'/'.$module;
-    }
+        {
+                    return $this->config('paths.assets').'/'.$module;
+        }
 
     /**
      * {@inheritDoc}
-     */
-    public function config(string $key, $default = null)
-    {
-        return $this->config->get('modules.'.$key, $default);
-    }
+             */
+    public function config(string $key, $default = null): mixed
+        {
+                    return $this->config->get('modules.'.$key, $default);
+        }
 
     /**
      * Get storage path for module used.
-     */
-    public function getUsedStoragePath(): string
-    {
-        $directory = storage_path('app/modules');
-        if ($this->getFiles()->exists($directory) === false) {
-            $this->getFiles()->makeDirectory($directory, 0777, true);
+             *
+             * @return string
+             */
+            public function getUsedStoragePath(): string
+        {
+                    $directory = storage_path('app/modules');
+                    if ($this->getFiles()->exists($directory) === false) {
+                                    $this->getFiles()->makeDirectory($directory, 0777, true);
+                    }
+
+                $path = storage_path('app/modules/modules.used');
+                    if (! $this->getFiles()->exists($path)) {
+                                    $this->put($path, '');
+                    }
+
+                return $path;
         }
 
-        $path = storage_path('app/modules/modules.used');
-        if (! $this->getFiles()->exists($path)) {
-            $this->getFiles()->put($path, '');
+            /**
+             * Determines if the given module is the "used" module.
+             *
+             * @param  string  $name
+             * @return bool
+             */
+            public function isUsed(string $name): bool
+        {
+                    return $name === $this->getUsedNow();
         }
-
-        return $path;
-    }
-
-    /**
-     * Set module used for cli session.
-     *
-     * @throws ModuleNotFoundException
-     */
-    public function setUsed($name)
-    {
-        $module = $this->findOrFail($name);
-
-        $this->getFiles()->put($this->getUsedStoragePath(), $module);
-
-        $module->fireEvent(ModuleEvent::USED);
-    }
 
     /**
      * Forget the module used for cli session.
-     */
-    public function forgetUsed()
-    {
-        if ($this->getFiles()->exists($this->getUsedStoragePath())) {
-            $this->getFiles()->delete($this->getUsedStoragePath());
+             */
+            public function forgetUsed(): void
+        {
+                    if ($this->getFiles()->exists($this->getUsedStoragePath())) {
+                                    $this->getFiles()->delete($this->getUsedStoragePath());
+                    }
         }
-    }
 
-    /**
-     * Get module used for cli session.
-     *
-     * @throws ModuleNotFoundException
-     */
-    public function getUsedNow(): string
-    {
-        return $this->findOrFail($this->getFiles()->get($this->getUsedStoragePath()));
-    }
+            /**
+             * Get module used for cli session.
+             *
+             * @return string
+             */
+            public function getUsedNow(): string
+        {
+                    return $this->get($this->getUsedStoragePath());
+        }
 
-    /**
-     * Get laravel filesystem instance.
-     */
-    public function getFiles(): Filesystem
-    {
-        return $this->files;
-    }
+            /**
+             * Get laravel filesystem instance.
+             *
+             * @return Filesystem
+             */
+            public function getFiles(): Filesystem
+                {
+                            return $this->files;
+                }
 
     /**
      * Get module assets path.
-     */
-    public function getAssetsPath(): string
-    {
-        return $this->config('paths.assets');
-    }
-
-    /**
-     * Get asset url from a specific module.
-     *
-     * @throws InvalidAssetPath
-     */
-    public function asset(string $asset): string
-    {
-        if (Str::contains($asset, ':') === false) {
-            throw InvalidAssetPath::missingModuleName($asset);
+             *
+             * @return string
+             */
+            public function getAssetsPath(): string
+        {
+                    return $this->config('paths.assets');
         }
+
+            /**
+             * Get asset url from a specific module.
+             *
+             * @param  string  $asset
+             * @return string
+             *
+             * @throws InvalidAssetPath
+             */
+            public function asset(string $asset): string
+        {
+                    if (Str::contains($asset, ':') === false) {
+                                    throw InvalidAssetPath::missingModuleName($asset);
+                    }
+
         [$name, $url] = explode(':', $asset);
 
         $baseUrl = str_replace(public_path().DIRECTORY_SEPARATOR, '', $this->getAssetsPath());
 
-        $url = $this->url->asset($baseUrl."/{$name}/".$url);
+        $url = $this->url->asset($baseUrl.'/'.$name.'/'.$url);
 
         return str_replace(['http://', 'https://'], '//', $url);
-    }
+        }
+
+    /**
+     * Determine whether the given module is not activated.
+             *
+             * @param  string  $name
+             * @return bool
+             */
+            public function isNotActive(string $name): bool
+        {
+                    return ! $this->isActive($name);
+        }
+
+    /**
+     * Determine whether the given module is activated.
+             *
+             * @param  string  $name
+             * @return bool
+             */
+            public function isActive(string $name): bool
+        {
+                    return $this->findOrFail($name)->isEnabled();
+        }
+
+    /**
+     * Enabling specific module.
+             *
+             * @param  string  $name
+             * @return void
+             *
+             * @throws ModuleNotFoundException
+             */
+    public function enable(string $name): void
+        {
+                    $this->findOrFail($name)->enable();
+        }
+
+    /**
+     * Disabling specific module.
+             *
+             * @param  string  $name
+             * @return void
+             *
+             * @throws ModuleNotFoundException
+             */
+    public function disable(string $name): void
+        {
+                    $this->findOrFail($name)->disable();
+        }
 
     /**
      * {@inheritDoc}
-     */
-    public function isEnabled(string $name): bool
-    {
-        return $this->findOrFail($name)->isEnabled();
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    public function isDisabled(string $name): bool
-    {
-        return ! $this->isEnabled($name);
-    }
-
-    /**
-     * Enabling a specific module.
-     *
-     * @throws ModuleNotFoundException
-     */
-    public function enable(string $name)
-    {
-        $this->findOrFail($name)->enable();
-    }
-
-    /**
-     * Disabling a specific module.
-     *
-     * @throws ModuleNotFoundException
-     */
-    public function disable(string $name)
-    {
-        $this->findOrFail($name)->disable();
-    }
-
-    /**
-     * {@inheritDoc}
-     */
+             */
     public function delete(string $name): bool
-    {
-        return $this->findOrFail($name)->delete();
-    }
+        {
+                    return $this->findOrFail($name)->delete();
+        }
 
     /**
      * Update dependencies for the specified module.
-     */
-    public function update(string $module)
-    {
-        with(new Updater($this))->update($module);
-    }
+             *
+             * @param  string  $module
+             * @return void
+             */
+            public function update(string $module): void
+        {
+                    with(new Updater($this))->update($module);
+        }
 
-    /**
-     * Install the specified module.
-     */
-    public function install(string $name, string $version = 'dev-master', string $type = 'composer', bool $subtree = false): Process
-    {
-        $installer = new Installer($name, $version, $type, $subtree);
+            /**
+             * Install the specified module.
+             *
+             * @param  string  $name
+             * @param  string  $version
+             * @param  string  $type
+             * @param  bool  $subtree
+             * @return Process
+             */
+            public function install(string $name, string $version = 'dev-master', string $type = 'composer', bool $subtree = false): Process
+        {
+                    $installer = new Installer($name, $version, $type, $subtree);
 
         return $installer->run();
-    }
+        }
 
     /**
      * Get stub path.
-     */
+             *
+             * @return string|null
+             */
     public function getStubPath(): ?string
-    {
-        if ($this->stubPath !== null) {
-            return $this->stubPath;
-        }
+        {
+                    if ($this->stubPath !== null) {
+                                    return $this->stubPath;
+                    }
 
         if ($this->config('stubs.enabled') === true) {
-            return $this->config('stubs.path');
+                        return $this->config('stubs.path');
         }
 
         return $this->stubPath;
-    }
+        }
 
     /**
      * Set stub path.
-     */
+             *
+             * @param  string  $stubPath
+             * @return $this
+             */
     public function setStubPath(string $stubPath): self
-    {
-        $this->stubPath = $stubPath;
+        {
+                    $this->stubPath = $stubPath;
 
         return $this;
-    }
+        }
 
-    public function resetModules(): static
-    {
-        self::$modules = [];
+    /**
+     * Reset the instance-level module scan cache.
+             *
+             * This invalidates the memoized result of scan() so that the next call
+             * performs a fresh filesystem glob. Preferred over the old static reset
+             * because it only affects THIS repository instance, which means:
+     *  - Tests that call resetModules() only reset their own instance
+              *  - Octane workers are unaffected (each worker has its own singleton)
+     *  - artisan commands that share a process with other commands reset
+              *    only their repository singleton, not a shared static
+              *
+              * @return static
+              */
+             public function resetModules(): static
+         {
+                     $this->scannedModules = null;
 
-        return $this;
-    }
-}
+                 return $this;
+         }
+         }
