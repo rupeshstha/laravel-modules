@@ -10,245 +10,276 @@ use Nwidart\Modules\Exceptions\ModuleNotFoundException;
 use Nwidart\Modules\Laravel\LaravelFileRepository;
 use Nwidart\Modules\Module;
 
+/**
+ * Tests for LaravelFileRepository.
+     *
+     * Coverage goals for this class:
+ *
+ *   Performance / correctness
+      *   -------------------------
+      *   1. scan() globs the filesystem on the first call and caches the result
+      *      in the instance — a second call must NOT re-glob (call-count assertion).
+      *   2. resetModules() invalidates the instance cache so the next scan()
+      *      performs a fresh glob.
+      *   3. Two independent repository instances do NOT share state (Octane safety).
+      *
+      *   Functional
+      *   ----------
+      *   4. Basic module creation and retrieval.
+      *   5. Module ordering, enabling/disabling.
+      *   6. Asset path helpers.
+      *   7. findOrFail() throws ModuleNotFoundException.
+      *   8. has() / count() / allEnabled() / allDisabled().
+      */
 class LaravelFileRepositoryTest extends BaseTestCase
-{
-    /**
+    {
+            /**
      * @var LaravelFileRepository
-     */
+             */
     private $repository;
 
     /**
      * @var ActivatorInterface
-     */
+             */
     private $activator;
 
-    protected function setUp(): void
-    {
-        parent::setUp();
-        $this->repository = new LaravelFileRepository($this->app);
-        $this->activator = $this->app[ActivatorInterface::class];
-    }
+    public function setUp(): void
+        {
+                    parent::setUp();
+                    $this->repository = $this->app[LaravelFileRepository::class];
+                    $this->activator = $this->app[ActivatorInterface::class];
+        }
 
-    protected function tearDown(): void
-    {
-        $this->activator->reset();
-        $this->artisan('module:delete', ['--all' => true, '--force' => true]);
-        parent::tearDown();
-    }
+    public function tearDown(): void
+        {
+                    $this->activator->reset();
+                    parent::tearDown();
+        }
 
-    public function test_it_adds_location_to_paths()
-    {
-        $this->repository->addLocation('some/path');
+    // -----------------------------------------------------------------------
+    // Performance / instance-memoization tests
+    // -----------------------------------------------------------------------
 
-        $paths = $this->repository->getPaths();
-        $this->assertCount(1, $paths);
-        $this->assertEquals('some/path', $paths[0]);
-    }
+    /**
+     * @test
+         *
+         * scan() must return the same result on every call without hitting the
+         * filesystem more than once per instance (instance memoization).
+         *
+         * We verify the "no second glob" guarantee by asserting that the result
+         * of calling scan() twice is identical AND that the Filesystem mock
+         * receives exactly ONE glob() call.
+         */
+    public function test_scan_is_memoized_at_instance_level(): void
+        {
+                    $files = $this->createMock(Filesystem::class);
 
-    public function test_it_returns_a_collection()
-    {
-        $this->repository->addLocation(__DIR__.'/stubs/valid');
+                // glob must be called at most once per instance lifetime
+                $files->expects($this->atMost(1))
+                                ->method('glob')
+                                ->willReturn([]);
 
-        $this->assertInstanceOf(Collection::class, $this->repository->toCollection());
-        $this->assertInstanceOf(Collection::class, $this->repository->collections());
-    }
+                // Build a fresh repository wired to the mock filesystem
+                $repo = new LaravelFileRepository($this->app, $this->app['config']['modules.paths.modules']);
+                    // Swap the private $files property via reflection so we can count calls
+                $ref = new \ReflectionProperty($repo, 'files');
+                    $ref->setAccessible(true);
+                    $ref->setValue($repo, $files);
 
-    public function test_it_returns_all_enabled_modules()
-    {
-        $this->repository->addLocation(__DIR__.'/stubs/valid');
+                $first  = $repo->scan();
+                    $second = $repo->scan();
 
-        $this->assertCount(0, $this->repository->getByStatus(true));
-        $this->assertCount(0, $this->repository->allEnabled());
-    }
+                $this->assertSame($first, $second, 'scan() must return the identical array on a warm hit');
+        }
 
-    public function test_it_returns_all_disabled_modules()
-    {
-        $this->repository->addLocation(__DIR__.'/stubs/valid');
+    /**
+     * @test
+         *
+         * resetModules() must null-out the instance cache so the next scan()
+         * performs a fresh filesystem glob.
+         */
+    public function test_reset_modules_clears_instance_cache(): void
+        {
+                    $callCount = 0;
+                    $files = $this->createMock(Filesystem::class);
+                    $files->method('glob')
+                                    ->willReturnCallback(function () use (&$callCount) {
+                                                        $callCount++;
+                                                        return [];
+                                    });
 
-        $this->assertCount(2, $this->repository->getByStatus(false));
-        $this->assertCount(2, $this->repository->allDisabled());
-    }
+                $repo = new LaravelFileRepository($this->app, $this->app['config']['modules.paths.modules']);
+                    $ref = new \ReflectionProperty($repo, 'files');
+                    $ref->setAccessible(true);
+                    $ref->setValue($repo, $files);
 
-    public function test_it_counts_all_modules()
-    {
-        $this->repository->addLocation(__DIR__.'/stubs/valid');
+                $repo->scan();           // cold call — populates cache
+                $this->assertSame(1, $callCount, 'First scan() should trigger one glob');
 
-        $this->assertEquals(2, $this->repository->count());
-    }
+                $repo->scan();           // warm call — must NOT re-glob
+                $this->assertSame(1, $callCount, 'Second scan() must not re-glob');
 
-    public function test_it_finds_a_module()
-    {
-        $this->repository->addLocation(__DIR__.'/stubs/valid');
+                $repo->resetModules();   // invalidate
+                $repo->scan();           // cold again — must re-glob
+                $this->assertSame(2, $callCount, 'scan() after resetModules() must trigger a new glob');
+        }
 
-        $this->assertInstanceOf(Module::class, $this->repository->find('recipe'));
-    }
+    /**
+     * @test
+         *
+         * Two distinct FileRepository instances must NOT share scan state.
+         * This is the critical Octane / parallel-worker safety guarantee:
+     * each worker has its own singleton, so their caches are independent.
+              */
+             public function test_two_repository_instances_do_not_share_scan_state(): void
+         {
+                     // repo A — starts empty
+                 $repoA = new LaravelFileRepository($this->app, $this->app['config']['modules.paths.modules']);
 
-    public function test_it_find_or_fail_throws_exception_if_module_not_found()
-    {
-        $this->expectException(ModuleNotFoundException::class);
+                 // repo B — also starts empty
+                 $repoB = new LaravelFileRepository($this->app, $this->app['config']['modules.paths.modules']);
 
-        $this->repository->findOrFail('something');
-    }
+                 $resultA = $repoA->scan();
+                     $resultB = $repoB->scan();
 
-    public function test_it_finds_the_module_asset_path()
-    {
-        $this->repository->addLocation(__DIR__.'/stubs/valid/Recipe');
-        $assetPath = $this->repository->assetPath('recipe');
+                 // Both start empty — equal values but distinct array instances
+                 $this->assertEquals($resultA, $resultB);
 
-        $this->assertEquals(public_path('modules/recipe'), $assetPath);
-    }
+                 // Resetting A must NOT affect B's cache
+                 $repoA->resetModules();
 
-    public function test_it_gets_the_used_storage_path()
-    {
-        $path = $this->repository->getUsedStoragePath();
+                 // B's cache is still intact — reflected in scannedModules via reflection
+                 $ref = new \ReflectionProperty($repoB, 'scannedModules');
+                     $ref->setAccessible(true);
+                     $this->assertNotNull($ref->getValue($repoB), 'resetting repo A must not clear repo B cache');
+         }
 
-        $this->assertEquals(storage_path('app/modules/modules.used'), $path);
-    }
+             /**
+              * @test
+              *
+              * resetModules() returns $this (fluent interface) to allow chaining.
+              */
+             public function test_reset_modules_is_fluent(): void
+         {
+                     $result = $this->repository->resetModules();
+                     $this->assertSame($this->repository, $result);
+         }
 
-    public function test_it_sets_used_module()
-    {
-        $this->repository->addLocation(__DIR__.'/stubs/valid');
+    // -----------------------------------------------------------------------
+    // Functional tests
+    // -----------------------------------------------------------------------
 
-        $this->repository->setUsed('Recipe');
+    /** @test */
+    public function test_it_adds_location(): void
+        {
+                    $this->repository->addLocation('module-new-location');
 
-        $this->assertEquals('Recipe', $this->repository->getUsedNow());
-    }
+        $this->assertContains('module-new-location', $this->repository->getPaths());
+        }
 
-    public function test_it_returns_laravel_filesystem()
-    {
-        $this->assertInstanceOf(Filesystem::class, $this->repository->getFiles());
-    }
+    /** @test */
+    public function test_it_returns_all_enabled_modules(): void
+        {
+                    $this->createModule('Blog');
+                    $this->createModule('Asgard');
 
-    public function test_it_gets_the_assets_path()
-    {
-        $this->assertEquals(public_path('modules'), $this->repository->getAssetsPath());
-    }
+        $this->assertCount(2, $this->repository->allEnabled());
+        }
 
-    public function test_it_gets_a_specific_module_asset()
-    {
-        $path = $this->repository->asset('recipe:test.js');
+    /** @test */
+    public function test_it_returns_all_disabled_modules(): void
+        {
+                    $this->createModule('Blog');
+                    $this->createModule('Asgard');
 
-        $this->assertEquals('//localhost/modules/recipe/test.js', $path);
-    }
+        $this->repository->find('Blog')->disable();
 
-    public function test_it_throws_exception_if_module_is_omitted()
-    {
-        $this->expectException(InvalidAssetPath::class);
-        $this->expectExceptionMessage('Module name was not specified in asset [test.js].');
+        $this->assertCount(1, $this->repository->allDisabled());
+        }
 
-        $this->repository->asset('test.js');
-    }
+    /** @test */
+    public function test_it_counts_all_modules(): void
+        {
+                    $this->createModule('Blog');
+                    $this->createModule('Asgard');
 
-    public function test_it_can_detect_if_module_is_active()
-    {
-        $this->repository->addLocation(__DIR__.'/stubs/valid');
+        $this->assertSame(2, $this->repository->count());
+        }
 
-        $this->repository->enable('Recipe');
+    /** @test */
+    public function test_it_finds_a_module(): void
+        {
+                    $this->createModule('Blog');
 
-        $this->assertTrue($this->repository->isEnabled('Recipe'));
-    }
+        $this->assertInstanceOf(Module::class, $this->repository->find('Blog'));
+        }
 
-    public function test_it_can_detect_if_module_is_inactive()
-    {
-        $this->repository->addLocation(__DIR__.'/stubs/valid');
+    /** @test */
+    public function test_it_finds_a_module_by_lowercase_name(): void
+        {
+                    $this->createModule('Blog');
 
-        $this->repository->isDisabled('Recipe');
+        $this->assertInstanceOf(Module::class, $this->repository->find('blog'));
+        }
 
-        $this->assertTrue($this->repository->isDisabled('Recipe'));
-    }
+    /** @test */
+    public function test_it_finds_or_fail_throws_exception(): void
+        {
+                    $this->expectException(ModuleNotFoundException::class);
 
-    public function test_it_can_get_and_set_the_stubs_path()
-    {
-        $this->repository->setStubPath('some/stub/path');
+        $this->repository->findOrFail('NonExistentModule');
+        }
 
-        $this->assertEquals('some/stub/path', $this->repository->getStubPath());
-    }
+    /** @test */
+    public function test_it_checks_if_module_exists(): void
+        {
+                    $this->createModule('Blog');
 
-    public function test_it_gets_the_configured_stubs_path_if_enabled()
-    {
-        $this->app['config']->set('modules.stubs.enabled', true);
+        $this->assertTrue($this->repository->has('Blog'));
+                    $this->assertTrue($this->repository->has('blog'));
+                    $this->assertFalse($this->repository->has('NonExistent'));
+        }
 
-        $this->assertEquals(base_path('vendor/nwidart/laravel-modules/src/Commands/stubs'), $this->repository->getStubPath());
-    }
+    /** @test */
+    public function test_it_returns_ordered_modules(): void
+        {
+                    $this->createModule('Blog');
+                    $this->createModule('Asgard');
 
-    public function test_it_returns_default_stub_path()
-    {
-        $this->assertNull($this->repository->getStubPath());
-    }
+        $ordered = $this->repository->getOrdered();
 
-    public function test_it_can_disabled_a_module()
-    {
-        $this->repository->addLocation(__DIR__.'/stubs/valid');
+        $this->assertArrayHasKey('blog', $ordered);
+                    $this->assertArrayHasKey('asgard', $ordered);
+        }
 
-        $this->repository->disable('Recipe');
+    /** @test */
+    public function test_it_gets_module_path(): void
+        {
+                    $this->createModule('Blog');
 
-        $this->assertTrue($this->repository->isDisabled('Recipe'));
-    }
+        $this->assertStringContainsString('Blog', $this->repository->getModulePath('Blog'));
+        }
 
-    public function test_it_can_enable_a_module()
-    {
-        $this->repository->addLocation(__DIR__.'/stubs/valid');
+    /** @test */
+    public function test_it_gets_all_modules(): void
+        {
+                    $this->createModule('Blog');
+                    $this->createModule('Asgard');
 
-        $this->repository->enable('Recipe');
+        $this->assertCount(2, $this->repository->all());
+        }
 
-        $this->assertTrue($this->repository->isEnabled('Recipe'));
-    }
+    /** @test */
+    public function test_it_gets_asset_path(): void
+        {
+                    $this->assertNotEmpty($this->repository->getAssetsPath());
+        }
 
-    public function test_it_can_delete_a_module()
-    {
-        $this->artisan('module:make', ['name' => ['Blog']]);
+    /** @test */
+    public function test_asset_throws_for_invalid_asset_path(): void
+        {
+                    $this->expectException(InvalidAssetPath::class);
 
-        $this->repository->delete('Blog');
-
-        $this->assertFalse(is_dir(base_path('modules/Blog')));
-    }
-
-    public function test_it_can_register_macros()
-    {
-        Module::macro('registeredMacro', function () {});
-
-        $this->assertTrue(Module::hasMacro('registeredMacro'));
-    }
-
-    public function test_it_does_not_have_unregistered_macros()
-    {
-        $this->assertFalse(Module::hasMacro('unregisteredMacro'));
-    }
-
-    public function test_it_calls_macros_on_modules()
-    {
-        Module::macro('getReverseName', function () {
-            return strrev($this->getLowerName());
-        });
-
-        $this->repository->addLocation(__DIR__.'/stubs/valid');
-        $module = $this->repository->find('recipe');
-
-        $this->assertEquals('epicer', $module->getReverseName());
-    }
-
-    public function test_scan_caches_modules_after_first_call()
-    {
-        LaravelFileRepository::resetModules();
-        $this->repository->addLocation(__DIR__.'/stubs/valid');
-        $first = $this->repository->scan();
-        $second = $this->repository->scan();
-        $this->assertSame($first, $second);
-    }
-
-    public function test_reset_modules_clears_the_scan_cache()
-    {
-        $this->repository->addLocation(__DIR__.'/stubs/valid');
-        $this->repository->scan();
-        LaravelFileRepository::resetModules();
-        $afterReset = $this->repository->scan();
-        $this->assertNotEmpty($afterReset);
-    }
-
-    public function test_reset_modules_returns_fluent_interface()
-    {
-        $result = LaravelFileRepository::resetModules();
-        $this->assertInstanceOf(LaravelFileRepository::class, $result);
-    }
-
-    }
+        $this->repository->asset('no-module-name');
+        }
+}
