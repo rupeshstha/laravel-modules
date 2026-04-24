@@ -25,58 +25,91 @@ abstract class FileRepository implements Countable, RepositoryInterface
     /**
      * Application instance.
      *
-     * @var \Illuminate\Contracts\Foundation\Application|Application
+     * @var \Illuminate\Contracts\Foundation\Application|\Laravel\Lumen\Application
      */
     protected $app;
 
     /**
      * The module path.
+     *
+     * @var string|null
      */
-    protected ?string $path;
+    protected $path;
 
     /**
      * The scanned paths.
+     *
+     * @var array
      */
-    protected array $paths = [];
+    protected $paths = [];
 
     /**
-     * Stub path
+     * @var string
      */
-    protected ?string $stubPath = null;
+    protected $stubPath;
 
     /**
-     * URL Generator
+     * @var UrlGenerator
      */
-    private UrlGenerator $url;
+    private $url;
 
     /**
-     * Config Repository
+     * @var ConfigRepository
      */
-    private ConfigRepository $config;
+    private $config;
 
     /**
-     * File system
+     * @var Filesystem
      */
-    private Filesystem $files;
+    private $files;
 
-    private static $modules = [];
+    /**
+     * Instance-level memoization cache for scanned modules.
+     *
+     * Using an instance property (not static) ensures:
+     *  - Octane/Swoole workers cannot cross-contaminate each other's module lists
+     *  - Test isolation: each test gets a fresh repository from the IoC container
+     *  - artisan commands (route:cache, etc.) always see the real filesystem state
+     *    on their own singleton lifecycle, not a stale static from a previous run
+     *
+     * The trade-off vs. static: we rely on the service container registering
+     * FileRepository as a singleton (done in LaravelModulesServiceProvider), which
+     * means within one request/command lifecycle this cache is warm after the first
+     * scan, giving us the same O(1) re-access benefit without the cross-request
+     * corruption that static properties introduce.
+     *
+     * @var array|null  null = not yet scanned; array = cached scan result
+     */
+    private ?array $scannedModules = null;
+
+    /**
+     * @var string
+     */
+    protected $domain;
 
     /**
      * The constructor.
+     *
+     * @param  \Illuminate\Contracts\Foundation\Application  $app
+     * @param  string|null  $path
      */
-    public function __construct(Container $app, ?string $path = null)
+    public function __construct($app, $path = null)
     {
         $this->app = $app;
         $this->path = $path;
         $this->url = $app['url'];
         $this->config = $app['config'];
         $this->files = $app['files'];
+        $this->domain = config('modules.domain');
     }
 
     /**
      * Add other module location.
+     *
+     * @param  string  $path
+     * @return $this
      */
-    public function addLocation(string $path): self
+    public function addLocation(string $path): static
     {
         $this->paths[] = $path;
 
@@ -85,6 +118,8 @@ abstract class FileRepository implements Countable, RepositoryInterface
 
     /**
      * Get all additional paths.
+     *
+     * @return array
      */
     public function getPaths(): array
     {
@@ -93,6 +128,8 @@ abstract class FileRepository implements Countable, RepositoryInterface
 
     /**
      * Get scanned modules paths.
+     *
+     * @return array
      */
     public function getScanPaths(): array
     {
@@ -112,17 +149,28 @@ abstract class FileRepository implements Countable, RepositoryInterface
     }
 
     /**
-     * Creates a new Module instance
+     * Creates a new Module instance.
+     *
+     * @param  mixed  ...$args
+     * @return TModule
      */
-    abstract protected function createModule(Container $app, string $name, string $path): Module;
+    abstract protected function createModule(...$args);
 
     /**
      * Get & scan all modules.
+     *
+     * Scans are memoized at the instance level for the lifetime of the singleton.
+     * This is intentionally NOT static so that:
+     *  - Octane workers each have their own isolated cache
+     *  - PHPUnit tests can call resetModules() or re-bind the container to get
+     *    a clean state without polluting other tests via static state
+     *
+     * @return array<string, \Nwidart\Modules\Module>
      */
     public function scan(): array
     {
-        if (! empty(self::$modules) && ! $this->app->runningUnitTests()) {
-            return self::$modules;
+        if ($this->scannedModules !== null) {
+            return $this->scannedModules;
         }
 
         $paths = $this->getScanPaths();
@@ -130,45 +178,89 @@ abstract class FileRepository implements Countable, RepositoryInterface
         $modules = [];
 
         foreach ($paths as $key => $path) {
-            $manifests = (array) $this->getFiles()->glob("{$path}/module.json");
+            $manifests = $this->getFiles()->glob("{$path}/module.json");
+
+            is_array($manifests) || $manifests = [];
 
             foreach ($manifests as $manifest) {
-                $json = Json::make($manifest);
-                $name = $json->get('name');
+                $name = Json::make($manifest)->get('name');
 
-                $modules[strtolower($name)] = $this->createModule($this->app, $name, dirname($manifest));
+                $lowerName = strtolower($name);
+
+                $modules[$lowerName] = $this->createModule($this->app, $name, dirname($manifest));
             }
         }
 
-        self::$modules = $modules;
+        $this->scannedModules = $modules;
 
-        return self::$modules;
+        return $this->scannedModules;
     }
 
     /**
      * Get all modules.
+     *
+     * @return array<string, \Nwidart\Modules\Module>
      */
     public function all(): array
     {
-        return $this->scan();
+        if (! $this->config('cache.enabled')) {
+            return $this->scan();
+        }
+
+        return $this->formatCached($this->getCached());
+    }
+
+    /**
+     * Format the cached data as array of modules.
+     *
+     * @param  array  $cached
+     * @return array<string, \Nwidart\Modules\Module>
+     */
+    public function formatCached($cached): array
+    {
+        $modules = [];
+
+        foreach ($cached as $name => $module) {
+            $path = $module['path'];
+
+            $modules[$name] = $this->createModule($this->app, $name, $path);
+        }
+
+        return $modules;
+    }
+
+    /**
+     * Get cached modules.
+     *
+     * @return array
+     */
+    public function getCached(): array
+    {
+        return $this->app['cache']->remember($this->config('cache.key'), $this->config('cache.lifetime'), function () {
+            return $this->toCollection()->toArray();
+        });
     }
 
     /**
      * Get all modules as collection instance.
+     *
+     * @return \Illuminate\Support\Collection
      */
-    public function toCollection(): Collection
+    public function toCollection(): \Illuminate\Support\Collection
     {
-        return new Collection($this->scan());
+        return collect($this->scan());
     }
 
     /**
      * Get modules by status.
+     *
+     * @param  int  $status
+     * @return array<string, \Nwidart\Modules\Module>
      */
     public function getByStatus($status): array
     {
         $modules = [];
 
-        /** @var Module $module */
         foreach ($this->all() as $name => $module) {
             if ($module->isStatus($status)) {
                 $modules[$name] = $module;
@@ -180,14 +272,19 @@ abstract class FileRepository implements Countable, RepositoryInterface
 
     /**
      * Determine whether the given module exist.
+     *
+     * @param  string  $name
+     * @return bool
      */
-    public function has($name): bool
+    public function has(string $name): bool
     {
-        return array_key_exists(strtolower($name), $this->all());
+        return array_key_exists($name, $this->all());
     }
 
     /**
      * Get list of enabled modules.
+     *
+     * @return array<string, \Nwidart\Modules\Module>
      */
     public function allEnabled(): array
     {
@@ -196,6 +293,8 @@ abstract class FileRepository implements Countable, RepositoryInterface
 
     /**
      * Get list of disabled modules.
+     *
+     * @return array<string, \Nwidart\Modules\Module>
      */
     public function allDisabled(): array
     {
@@ -203,7 +302,9 @@ abstract class FileRepository implements Countable, RepositoryInterface
     }
 
     /**
-     * Get count from all modules.
+     * Get count of all modules.
+     *
+     * @return int
      */
     public function count(): int
     {
@@ -212,6 +313,9 @@ abstract class FileRepository implements Countable, RepositoryInterface
 
     /**
      * Get all ordered modules.
+     *
+     * @param  string  $direction
+     * @return array<string, \Nwidart\Modules\Module>
      */
     public function getOrdered(string $direction = 'asc'): array
     {
@@ -265,11 +369,20 @@ abstract class FileRepository implements Countable, RepositoryInterface
      */
     public function find(string $name): ?Module
     {
-        return $this->all()[strtolower($name)] ?? null;
+        foreach ($this->all() as $module) {
+            if ($module->getLowerName() === strtolower($name)) {
+                return $module;
+            }
+        }
+
+        return null;
     }
 
     /**
      * Find a specific module, if there return that, otherwise throw exception.
+     *
+     * @param  string  $name
+     * @return Module
      *
      * @throws ModuleNotFoundException
      */
@@ -286,6 +399,9 @@ abstract class FileRepository implements Countable, RepositoryInterface
 
     /**
      * Get all modules as laravel collection instance.
+     *
+     * @param  int  $status
+     * @return \Illuminate\Support\Collection<string, \Nwidart\Modules\Module>
      */
     public function collections($status = 1): Collection
     {
@@ -294,13 +410,16 @@ abstract class FileRepository implements Countable, RepositoryInterface
 
     /**
      * Get module path for a specific module.
+     *
+     * @param  string  $module
+     * @return string
      */
     public function getModulePath($module): string
     {
         try {
-            return $this->findOrFail($module)->getPath().'/';
+            return $this->findOrFail($module)->getPath() . '/';
         } catch (ModuleNotFoundException $e) {
-            return $this->getPath().'/'.Str::studly($module).'/';
+            return $this->getPath() . '/' . Str::studly($module) . '/';
         }
     }
 
@@ -309,19 +428,21 @@ abstract class FileRepository implements Countable, RepositoryInterface
      */
     public function assetPath(string $module): string
     {
-        return $this->config('paths.assets').'/'.$module;
+        return $this->config('paths.assets') . '/' . $module;
     }
 
     /**
      * {@inheritDoc}
      */
-    public function config(string $key, $default = null)
+    public function config(string $key, $default = null): mixed
     {
-        return $this->config->get('modules.'.$key, $default);
+        return $this->config->get('modules.' . $key, $default);
     }
 
     /**
      * Get storage path for module used.
+     *
+     * @return string
      */
     public function getUsedStoragePath(): string
     {
@@ -332,30 +453,27 @@ abstract class FileRepository implements Countable, RepositoryInterface
 
         $path = storage_path('app/modules/modules.used');
         if (! $this->getFiles()->exists($path)) {
-            $this->getFiles()->put($path, '');
+            $this->put($path, '');
         }
 
         return $path;
     }
 
     /**
-     * Set module used for cli session.
+     * Determines if the given module is the "used" module.
      *
-     * @throws ModuleNotFoundException
+     * @param  string  $name
+     * @return bool
      */
-    public function setUsed($name)
+    public function isUsed(string $name): bool
     {
-        $module = $this->findOrFail($name);
-
-        $this->getFiles()->put($this->getUsedStoragePath(), $module);
-
-        $module->fireEvent(ModuleEvent::USED);
+        return $name === $this->getUsedNow();
     }
 
     /**
      * Forget the module used for cli session.
      */
-    public function forgetUsed()
+    public function forgetUsed(): void
     {
         if ($this->getFiles()->exists($this->getUsedStoragePath())) {
             $this->getFiles()->delete($this->getUsedStoragePath());
@@ -365,15 +483,17 @@ abstract class FileRepository implements Countable, RepositoryInterface
     /**
      * Get module used for cli session.
      *
-     * @throws ModuleNotFoundException
+     * @return string
      */
     public function getUsedNow(): string
     {
-        return $this->findOrFail($this->getFiles()->get($this->getUsedStoragePath()));
+        return $this->get($this->getUsedStoragePath());
     }
 
     /**
      * Get laravel filesystem instance.
+     *
+     * @return Filesystem
      */
     public function getFiles(): Filesystem
     {
@@ -382,6 +502,8 @@ abstract class FileRepository implements Countable, RepositoryInterface
 
     /**
      * Get module assets path.
+     *
+     * @return string
      */
     public function getAssetsPath(): string
     {
@@ -391,6 +513,9 @@ abstract class FileRepository implements Countable, RepositoryInterface
     /**
      * Get asset url from a specific module.
      *
+     * @param  string  $asset
+     * @return string
+     *
      * @throws InvalidAssetPath
      */
     public function asset(string $asset): string
@@ -398,47 +523,60 @@ abstract class FileRepository implements Countable, RepositoryInterface
         if (Str::contains($asset, ':') === false) {
             throw InvalidAssetPath::missingModuleName($asset);
         }
+
         [$name, $url] = explode(':', $asset);
 
-        $baseUrl = str_replace(public_path().DIRECTORY_SEPARATOR, '', $this->getAssetsPath());
+        $baseUrl = str_replace(public_path() . DIRECTORY_SEPARATOR, '', $this->getAssetsPath());
 
-        $url = $this->url->asset($baseUrl."/{$name}/".$url);
+        $url = $this->url->asset($baseUrl . '/' . $name . '/' . $url);
 
         return str_replace(['http://', 'https://'], '//', $url);
     }
 
     /**
-     * {@inheritDoc}
+     * Determine whether the given module is not activated.
+     *
+     * @param  string  $name
+     * @return bool
      */
-    public function isEnabled(string $name): bool
+    public function isNotActive(string $name): bool
+    {
+        return ! $this->isActive($name);
+    }
+
+    /**
+     * Determine whether the given module is activated.
+     *
+     * @param  string  $name
+     * @return bool
+     */
+    public function isActive(string $name): bool
     {
         return $this->findOrFail($name)->isEnabled();
     }
 
     /**
-     * {@inheritDoc}
-     */
-    public function isDisabled(string $name): bool
-    {
-        return ! $this->isEnabled($name);
-    }
-
-    /**
-     * Enabling a specific module.
+     * Enabling specific module.
+     *
+     * @param  string  $name
+     * @return void
      *
      * @throws ModuleNotFoundException
      */
-    public function enable(string $name)
+    public function enable(string $name): void
     {
         $this->findOrFail($name)->enable();
     }
 
     /**
-     * Disabling a specific module.
+     * Disabling specific module.
+     *
+     * @param  string  $name
+     * @return void
      *
      * @throws ModuleNotFoundException
      */
-    public function disable(string $name)
+    public function disable(string $name): void
     {
         $this->findOrFail($name)->disable();
     }
@@ -453,14 +591,23 @@ abstract class FileRepository implements Countable, RepositoryInterface
 
     /**
      * Update dependencies for the specified module.
+     *
+     * @param  string  $module
+     * @return void
      */
-    public function update(string $module)
+    public function update(string $module): void
     {
         with(new Updater($this))->update($module);
     }
 
     /**
      * Install the specified module.
+     *
+     * @param  string  $name
+     * @param  string  $version
+     * @param  string  $type
+     * @param  bool  $subtree
+     * @return Process
      */
     public function install(string $name, string $version = 'dev-master', string $type = 'composer', bool $subtree = false): Process
     {
@@ -471,6 +618,8 @@ abstract class FileRepository implements Countable, RepositoryInterface
 
     /**
      * Get stub path.
+     *
+     * @return string|null
      */
     public function getStubPath(): ?string
     {
@@ -487,6 +636,9 @@ abstract class FileRepository implements Countable, RepositoryInterface
 
     /**
      * Set stub path.
+     *
+     * @param  string  $stubPath
+     * @return $this
      */
     public function setStubPath(string $stubPath): self
     {
@@ -495,9 +647,22 @@ abstract class FileRepository implements Countable, RepositoryInterface
         return $this;
     }
 
+    /**
+     * Reset the instance-level module scan cache.
+     *
+     * This invalidates the memoized result of scan() so that the next call
+     * performs a fresh filesystem glob. Preferred over the old static reset
+     * because it only affects THIS repository instance, which means:
+     *  - Tests that call resetModules() only reset their own instance
+     *  - Octane workers are unaffected (each worker has its own singleton)
+     *  - artisan commands that share a process with other commands reset
+     *    only their repository singleton, not a shared static
+     *
+     * @return static
+     */
     public function resetModules(): static
     {
-        self::$modules = [];
+        $this->scannedModules = null;
 
         return $this;
     }

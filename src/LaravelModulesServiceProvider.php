@@ -9,6 +9,8 @@ use Illuminate\Filesystem\Filesystem;
 use Illuminate\Foundation\Console\AboutCommand;
 use Illuminate\Support\Facades\Blade;
 use Illuminate\Translation\Translator;
+use Nwidart\Modules\Commands\ModuleCacheCommand;
+use Nwidart\Modules\Commands\ModuleClearCommand;
 use Nwidart\Modules\Contracts\ActivatorInterface;
 use Nwidart\Modules\Contracts\RepositoryInterface;
 use Nwidart\Modules\Exceptions\InvalidActivatorClass;
@@ -23,19 +25,11 @@ class LaravelModulesServiceProvider extends ModulesServiceProvider
     public function boot()
     {
         $this->registerNamespaces();
-
-        AboutCommand::add('Laravel-Modules', [
-            'Version' => fn () => InstalledVersions::getPrettyVersion('nwidart/laravel-modules'),
-        ]);
-
-        // Create @module() blade directive.
-        Blade::if('module', function (string $name) {
-            return module($name);
-        });
+        $this->registerModules();
     }
 
     /**
-     * Register the service provider.
+     * Register the package.
      */
     public function register()
     {
@@ -46,7 +40,7 @@ class LaravelModulesServiceProvider extends ModulesServiceProvider
         $this->registerMigrations();
         $this->registerTranslations();
 
-        $this->mergeConfigFrom(__DIR__.'/../config/config.php', 'modules');
+        $this->mergeConfigFrom(__DIR__ . '/../config/config.php', 'modules');
 
         $this->registerModules();
     }
@@ -56,7 +50,7 @@ class LaravelModulesServiceProvider extends ModulesServiceProvider
      */
     public function setupStubPath()
     {
-        $path = $this->app['config']->get('modules.stubs.path') ?? __DIR__.'/Commands/stubs';
+        $path = $this->app['config']->get('modules.stubs.path') ?? __DIR__ . '/Commands/stubs';
         Stub::setBasePath($path);
 
         $this->app->booted(function ($app) {
@@ -80,7 +74,7 @@ class LaravelModulesServiceProvider extends ModulesServiceProvider
         });
         $this->app->singleton(ActivatorInterface::class, function ($app) {
             $activator = $app['config']->get('modules.activator');
-            $class = $app['config']->get('modules.activators.'.$activator)['class'];
+            $class = $app['config']->get('modules.activators.' . $activator)['class'];
 
             if ($class === null) {
                 throw InvalidActivatorClass::missingConfig();
@@ -92,14 +86,30 @@ class LaravelModulesServiceProvider extends ModulesServiceProvider
 
         $this->app->singleton(
             ModuleManifest::class,
-            fn () => new ModuleManifest(
-                new Filesystem,
-                app(RepositoryInterface::class)->getScanPaths(),
-                $this->getCachedModulePath(),
-                app(ActivatorInterface::class)
-            )
+            function ($app) {
+                /** @var RepositoryInterface $repository */
+                $repository = $app[RepositoryInterface::class];
+
+                $manifest = new ModuleManifest(
+                    new Filesystem,
+                    $this->getCachedModulePath()
+                );
+
+                // Populate the scan paths from the repository so the manifest
+                // knows where to glob when the compiled cache is absent.
+                $manifest->paths = collect($repository->getScanPaths());
+
+                return $manifest;
+            }
         );
 
+        // Register the module:cache and module:clear artisan commands
+        if ($this->app->runningInConsole()) {
+            $this->commands([
+                ModuleCacheCommand::class,
+                ModuleClearCommand::class,
+            ]);
+        }
     }
 
     protected function registerMigrations(): void
@@ -122,16 +132,11 @@ class LaravelModulesServiceProvider extends ModulesServiceProvider
         if (! $this->app['config']->get('modules.auto-discover.translations', true)) {
             return;
         }
-        $this->callAfterResolving('translator', function (TranslatorContract $translator) {
-            if (! $translator instanceof Translator) {
-                return;
-            }
 
+        $this->app->resolving(TranslatorContract::class, function (Translator $translator) {
             collect(Module::allEnabled())
                 ->each(function (Laravel\Module $module) use ($translator) {
-                    $path = $module->getExtraPath($this->app['config']->get('modules.paths.generator.lang.path'));
-                    $translator->addNamespace($module->getLowerName(), $path);
-                    $translator->addJsonPath($path);
+                    $translator->addNamespace($module->getLowerName(), $module->getExtraPath('Resources/lang'));
                 });
         });
     }
